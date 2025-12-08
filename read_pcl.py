@@ -8,6 +8,7 @@ import pyimof  # just for optical flow
 import config as cfg
 
 if cfg.USE_X11:
+    # Benim makinam için (wsl için gerekli)
     os.environ["XDG_SESSION_TYPE"] = "x11"
 
 
@@ -164,8 +165,8 @@ def align_color_to_depth(depth, color, camera_params: dict):
     world2cam, world2depth = np.array(camera_params["word2cam"]), np.array(camera_params["world2depth"])
     
     # Undistort images
-    depth, Kd = undistort(depth, Kd, dist_d)
-    color, Kc = undistort(color, Kc, dist_c)
+    # depth, Kd = undistort(depth, Kd, dist_d)
+    # color, Kc = undistort(color, Kc, dist_c)
 
     h, w = depth.shape[:2]
     color_out = np.zeros((h, w, 3), dtype=np.uint8)
@@ -255,15 +256,15 @@ def create_pcl(rgb_frame: np.ndarray, depth_frame: np.ndarray, camera_params: di
     pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
         image=o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(rgb_frame),
-            o3d.geometry.Image(depth_frame),
+            o3d.geometry.Image(np.ascontiguousarray(depth_frame)),
             depth_scale=1000.0,
-            depth_trunc=5,
+            depth_trunc=10,
             convert_rgb_to_intensity=False,
         ),
         intrinsic=o3d.camera.PinholeCameraIntrinsic(
             width=rgb_frame.shape[1], height=rgb_frame.shape[0], fx=fx_c, fy=fy_c, cx=cx_c, cy=cy_c
         ),
-        extrinsic=world2cam
+        # extrinsic=world2cam
     )
     return pcd
 
@@ -287,9 +288,94 @@ def create_pcl_from_depth(depth_frame: np.ndarray, camera_params: np.ndarray) ->
     )
     return pcd
 
+
+def integrate_pointclouds_tsdf(
+    rgb_frames: list[np.ndarray],
+    depth_frames: list[np.ndarray],
+    camera_params_list: list[dict],
+    volume_length: float = 10.0,
+    voxel_length: float = 0.006,
+    sdf_trunc: float = 0.04,
+    depth_scale: float = 1000.0,
+    depth_trunc: float = 10.0
+) -> o3d.geometry.PointCloud:
+    """
+    Integrates multiple point clouds into one using TSDF (Truncated Signed Distance Function).
+    
+    Args:
+        rgb_frames: List of RGB images (BGR format from OpenCV).
+        depth_frames: List of depth images (uint16, depth in millimeters).
+        camera_params_list: List of camera parameter dictionaries, each containing:
+            - "K": camera intrinsic matrix
+            - "word2cam": world-to-camera transformation matrix (4x4)
+        volume_length: Length of the TSDF volume in meters.
+        voxel_length: Size of each voxel in meters.
+        sdf_trunc: Truncation value for the signed distance function.
+        depth_scale: Scale factor to convert depth values to meters (1000.0 for mm to m).
+        depth_trunc: Maximum depth value to consider in meters.
+    
+    Returns:
+        A single integrated point cloud extracted from the TSDF volume.
+    """
+    
+    # Create TSDF volume
+    volume = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=voxel_length,
+        sdf_trunc=sdf_trunc,
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+    )
+    
+    # Integrate each RGBD image into the TSDF volume
+    for rgb_frame, depth_frame, camera_params in zip(rgb_frames, depth_frames, camera_params_list):
+        assert rgb_frame.shape[:2] == depth_frame.shape[:2], \
+            f"RGB and depth frames must have the same dimensions. Got RGB: {rgb_frame.shape}, Depth: {depth_frame.shape}"
+        
+        # Convert BGR to RGB for Open3D
+        rgb_frame_rgb = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
+        
+        # Create RGBD image
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            o3d.geometry.Image(rgb_frame_rgb),
+            o3d.geometry.Image(np.ascontiguousarray(depth_frame)),
+            depth_scale=depth_scale,
+            depth_trunc=depth_trunc,
+            convert_rgb_to_intensity=False
+        )
+        
+        # Get camera intrinsic matrix
+        K = np.array(camera_params["K"])
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        width, height = rgb_frame.shape[1], rgb_frame.shape[0]
+        
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            width=width,
+            height=height,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy
+        )
+        
+        # Get camera extrinsic (world-to-camera transformation)
+        world2cam = np.array(camera_params["word2cam"])
+        assert world2cam.shape == (4, 4), \
+            f"world2cam must be a 4x4 matrix, got shape {world2cam.shape}"
+        
+        # Integrate into TSDF volume
+        volume.integrate(rgbd, intrinsic, world2cam)
+    
+    # Extract point cloud from TSDF volume
+    mesh = volume.extract_triangle_mesh()
+    pcd = mesh.sample_points_uniformly(number_of_points=100000)
+    
+    assert len(pcd.points) > 0, "Integrated point cloud should contain at least one point"
+    return pcd
+
+
 if __name__ == "__main__":
-    rgb_frame = cv2.imread("full_depth/Aoutput0_600_rgb.png")
-    depth_frame = cv2.imread("full_depth/Aoutput0_600_depth.png", cv2.IMREAD_UNCHANGED)
+    # rgb_frame = cv2.imread("full_depth/Aoutput0_600_rgb.png")
+    # depth_frame = cv2.imread("full_depth/Aoutput0_600_depth.png", cv2.IMREAD_UNCHANGED)
 
 
     # K = CAMERA_PARAMS["Aoutput0"]["K"]
@@ -308,14 +394,41 @@ if __name__ == "__main__":
     # cv2.waitKey(0)
     # cv2.destroyAllWindows()
 
-    # depth_viz = viz_depth(depth_frame)
     # cv2.imshow("Depth Viz", depth_viz)
 
-    color_aligned, depth_frame = align_color_to_depth(depth_frame, rgb_frame, CAMERA_PARAMS["Aoutput0"])
-    # cv2.imwrite("samples/color_aligned.png", color_aligned)
-    cv2.imshow("Color Aligned", color_aligned)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    # color_aligned, depth_frame = align_color_to_depth(depth_frame, rgb_frame, CAMERA_PARAMS["Aoutput0"])
+    # cv2.imwrite("samples/distorted_aligned_color.png", color_aligned)
+    # cv2.imshow("Color Aligned", color_aligned)
+    # depth_viz = viz_depth(depth_frame)
+    # # cv2.imwrite("samples/distorted_aligned_depth.png", depth_viz)
+    # cv2.imshow("Depth Viz", depth_viz)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
 
-    pcd = create_pcl(color_aligned, depth_frame, CAMERA_PARAMS["Aoutput0"])
+    # pcd = create_pcl(color_aligned, depth_frame, CAMERA_PARAMS["Aoutput0"])
+    # o3d.visualization.draw_geometries([pcd])
+
+
+    rgb_frames = []
+    depth_frames = []
+    camera_params_list = []
+    pcds = []
+
+    for camera_name in ALL_CAMERAS:
+        if camera_name == "hololens":
+            continue
+        
+        print(camera_name)
+
+        rgb = cv2.imread(f"full_depth/{camera_name}_600_rgb.png")
+        depth = cv2.imread(f"full_depth/{camera_name}_600_depth.png", cv2.IMREAD_UNCHANGED)
+        rgb, depth = align_color_to_depth(depth, rgb, CAMERA_PARAMS[camera_name])
+        rgb_frames.append(rgb)
+        depth_frames.append(depth)
+        camera_params_list.append(CAMERA_PARAMS[camera_name])
+        # pcd = create_pcl(rgb, depth, CAMERA_PARAMS[camera_name])
+        # o3d.visualization.draw_geometries([pcd])
+        
+
+    pcd = integrate_pointclouds_tsdf(rgb_frames, depth_frames, camera_params_list)
     o3d.visualization.draw_geometries([pcd])

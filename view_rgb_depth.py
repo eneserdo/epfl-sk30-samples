@@ -1,9 +1,4 @@
-# Enes Erdogan
-# View rgb and depth images overlapped to check the alignment
-# Press 'w', 'a', 's', 'd' to shift the rgb image
-# Press 'q' to quit
-# Press 'space' to pause/resume
-# TODO: view selected frames as pcd with open3d
+raise "this code is depreciated, might be removed"
 
 import argparse
 import datetime
