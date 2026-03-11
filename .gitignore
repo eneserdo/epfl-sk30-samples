@@ -3,3 +3,6 @@
 *.zip
 config.py
 __pycache__/
+*.pcd
+*.ply
+*.png
