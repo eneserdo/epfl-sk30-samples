@@ -1,6 +1,4 @@
 # Read camera params and image, then reconstruct the point cloud
-
-import ast
 import json
 import os
 from typing import Callable
@@ -161,33 +159,16 @@ def viz_dist_flow(image: np.ndarray, K: np.ndarray, dist: np.ndarray) -> np.ndar
 
     return optical_flow_vis
 
-
-
-def align_color_to_depth(depth, color, camera_params: dict):
-    # TODO: encapsulate this in a function
-    Kc, dist_c = np.array(camera_params["K"]), np.array(camera_params["dist"])
-    Kd, dist_d = np.array(camera_params["depth_K"]), np.array(camera_params["depth_dist"])
-    world2cam, world2depth = np.array(camera_params["word2cam"]), np.array(camera_params["world2depth"])
-    
-    # Undistort images
-    # depth, Kd = undistort(depth, Kd, dist_d)
-    # color, Kc = undistort(color, Kc, dist_c)
-
-    h, w = depth.shape[:2]
-    color_out = np.zeros((h, w, 3), dtype=np.uint8)
-
-    fx_d, fy_d = Kd[0,0], Kd[1,1]
-    cx_d, cy_d = Kd[0,2], Kd[1,2]
-
-    fx_c, fy_c = Kc[0,0], Kc[1,1]
-    cx_c, cy_c = Kc[0,2], Kc[1,2]
-
-    Rc = world2cam[:3, :3]
-    tc = world2cam[:3, 3].reshape(3, 1)
-    Rd = world2depth[:3, :3]
-    td = world2depth[:3, 3].reshape(3, 1)
-
+def get_transform_matrix(world2cam1, world2cam2):
     """
+    world2cam1: 4x4 matrix
+    world2cam2: 4x4 matrix
+    Returns:
+    R: 3x3 rotation matrix
+    t: 3x1 translation vector
+
+    R,t is used to transform points in cam2 to cam1, so they are in the same coordinate system.
+
     Given:
     Oc = Rc*Ow + tc
     Od = Rd*Ow + td
@@ -209,10 +190,36 @@ def align_color_to_depth(depth, color, camera_params: dict):
     R = Rc*Rd.T
     t = tc - Rc*Rd.T*td
     """
+    Rc = world2cam1[:3, :3]
+    tc = world2cam1[:3, 3].reshape(3, 1)
+    Rd = world2cam2[:3, :3]
+    td = world2cam2[:3, 3].reshape(3, 1)
+
     R = Rc @ Rd.T
     t = tc - R @ td
     t = t.reshape(3,1)
+    return R, t
 
+def align_color_to_depth(depth, color, camera_params: dict):
+    # TODO: encapsulate this in a function
+    Kc, dist_c = np.array(camera_params["K"]), np.array(camera_params["dist"])
+    Kd, dist_d = np.array(camera_params["depth_K"]), np.array(camera_params["depth_dist"])
+    world2cam, world2depth = np.array(camera_params["word2cam"]), np.array(camera_params["world2depth"])
+    
+    # Undistort images
+    # depth, Kd = undistort(depth, Kd, dist_d)
+    # color, Kc = undistort(color, Kc, dist_c)
+
+    h, w = depth.shape[:2]
+    color_out = np.zeros((h, w, 3), dtype=np.uint8)
+
+    fx_d, fy_d = Kd[0,0], Kd[1,1]
+    cx_d, cy_d = Kd[0,2], Kd[1,2]
+
+    fx_c, fy_c = Kc[0,0], Kc[1,1]
+    cx_c, cy_c = Kc[0,2], Kc[1,2]
+
+    R, t = get_transform_matrix(world2cam, world2depth)
     # For every pixel in the depth image, find the corresponding pixel in the color image and sample the color.
     for v in range(h):
         for u in range(w):
@@ -249,25 +256,23 @@ def create_pcl(rgb_frame: np.ndarray, depth_frame: np.ndarray, camera_params: di
     """
     Creates a point cloud from the rgb and depth frames.
     """
-    # FIXME: add undistortion
+    # FIXME: add undistortion using depth distortion parameters
     world2depth = np.array(camera_params["world2depth"])
 
     Kd = np.array(camera_params["depth_K"])   
     fx_d, fy_d = Kd[0,0], Kd[1,1]
     cx_d, cy_d = Kd[0,2], Kd[1,2]
 
-    rgb_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
-
     pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
         image=o3d.geometry.RGBDImage.create_from_color_and_depth(
-            o3d.geometry.Image(rgb_frame),
+            o3d.geometry.Image(cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)),
             o3d.geometry.Image(np.ascontiguousarray(depth_frame)),
             depth_scale=1000.0,
             depth_trunc=10,
             convert_rgb_to_intensity=False,
         ),
         intrinsic=o3d.camera.PinholeCameraIntrinsic(
-            width=rgb_frame.shape[1], height=rgb_frame.shape[0], fx=fx_d, fy=fy_d, cx=cx_d, cy=cy_d
+            width=depth_frame.shape[1], height=depth_frame.shape[0], fx=fx_d, fy=fy_d, cx=cx_d, cy=cy_d
         ),
         extrinsic=world2depth
     )
@@ -304,8 +309,7 @@ def integrate_pointclouds_tsdf(
     voxel_length: float = 0.006,
     sdf_trunc: float = 0.04,
     depth_scale: float = 1000.0,
-    depth_trunc: float = 10.0
-) -> o3d.geometry.PointCloud:
+    depth_trunc: float = 10.0) -> o3d.geometry.PointCloud:
     """
     Integrates multiple point clouds into one using TSDF (Truncated Signed Distance Function).
     
@@ -350,7 +354,7 @@ def integrate_pointclouds_tsdf(
         )
         
         # Get camera intrinsic matrix
-        K = np.array(camera_params["K"])
+        K = np.array(camera_params["depth_K"])
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
         width, height = rgb_frame.shape[1], rgb_frame.shape[0]
@@ -382,20 +386,19 @@ def integrate_pointclouds_tsdf(
 
 def get_handpose_reader(handpose_path: str) -> Callable[[int], tuple[np.ndarray, np.ndarray]]:
     """
-    Reads the hand pose from the handpose file.
+    Returns a function that reads the hand pose from the handpose file.
+    To load data once and use multiple times, I used closure.
     """
 
     df = pd.read_csv(handpose_path, usecols=["hololefts", "holorights", "world2holo"])
-
-    # json.loads is ~5-10x faster than ast.literal_eval for numeric arrays,
-    # and map avoids per-element pandas overhead compared to Series.apply
+    
     hololefts = np.array(list(map(json.loads, df["hololefts"])))
     holorights = np.array(list(map(json.loads, df["holorights"])))
     world2holo = np.array(list(map(json.loads, df["world2holo"])))
 
     # return "hololefts" and "holorights" columns
     def get_handpose(frame_idx: int) -> tuple[np.ndarray, np.ndarray]:
-        return np.concatenate([hololefts[frame_idx][:, :3], holorights[frame_idx][:, :3]], axis=0), world2holo[frame_idx]
+        return np.concatenate([hololefts[frame_idx], holorights[frame_idx]], axis=0), world2holo[frame_idx]
 
     return get_handpose
 
@@ -413,32 +416,59 @@ def reproject_handpose(points, world2holo, holo_params, camera_params: dict) -> 
     world2cam = np.array(camera_params["word2cam"])
     
 
-    fx_c, fy_c = K_c[0,0], K_c[1,1]
-    cx_c, cy_c = K_c[0,2], K_c[1,2]
+    # R_h = world2holo[:3, :3]
+    # t_h = world2holo[:3, 3].reshape(3, 1)
+    # R_c = world2holo[:3, :3]
+    # t_c = world2cam[:3, 3].reshape(3, 1)
 
-    # fx_h, fy_h = K_h[0,0], K_h[1,1]
-    # cx_h, cy_h = K_h[0,2], K_h[1,2]
+    # R = R_c @ R_h.T
+    # t = t_c - R @ t_h
+    # t = t.reshape(3,1)
 
-    R_h = world2holo[:3, :3]
-    t_h = world2holo[:3, 3].reshape(3, 1)
-    R_c = world2cam[:3, :3]
-    t_c = world2cam[:3, 3].reshape(3, 1)
+    # R, t = get_transform_matrix(world2cam, world2holo)
 
-    R = R_h @ R_c.T
-    t = t_h - R @ t_c
-    t = t.reshape(3,1)
+    # holo2cam = np.eye(4)
+    # holo2cam[:3, :3] = R
+    # holo2cam[:3, 3] = t.flatten()
 
     # first transform the world coordinates
-    points_c = (R @ points.T + t).T
+    # points_c = points @ holo2cam.T
+    points_c = points @ world2cam.T
+    assert np.allclose(points_c[:, 3], 1), "Check me!!"
+    points_c = points_c[:, :3]
 
     # then project to the camera image
-    u = fx_c * points_c[:, 0] / points_c[:, 2] + cx_c
-    v = fy_c * points_c[:, 1] / points_c[:, 2] + cy_c
+    points_uv = points_c @ K_c.T
+    points_uv = points_uv / points_uv[:, 2:]
+    points_uv = points_uv[:, :2]
 
     # TODO: use distortion model
 
     # return np.stack([u, v], axis=0).T
-    return u, v
+    return points_uv[:, 0], points_uv[:, 1]
+
+
+def reproject_handpose_to_holo(points, world2holo, holo_params, frame) -> np.ndarray:
+    K_h, dist_h = np.array(holo_params["K"]), np.array(holo_params["dist"])
+
+    # TODO: use distortion model
+
+    # world2holo: 4x4 matrix
+    # points: 4xN array (homogeneous coordinates)
+    points_xy = points @ world2holo.T
+    assert points_xy[:, 3].all() == 1, "Check me!!"
+    points_xy = points_xy[:, :3]
+    # => points_xy: 3xN array
+
+    # project points to holo image
+    points_uv = points_xy @ K_h.T
+    points_uv = points_uv / points_uv[:, 2:]
+    points_uv = points_uv[:, :2]
+
+    for u, v in zip(points_uv[:, 0], points_uv[:, 1]):
+        cv2.circle(frame, (int(u), int(v)), 5, (0, 0, 255), -1)
+
+    return frame
 
 
 if __name__ == "__main__":
@@ -496,25 +526,32 @@ if __name__ == "__main__":
     #     camera_params_list.append(CAMERA_PARAMS[camera_name])
     #     pcd = create_pcl(rgb, depth, CAMERA_PARAMS[camera_name])
     #     print(f"Writing {camera_name}.pcd: {np.asarray(pcd.points).shape[0]} points")
-    #     # o3d.io.write_point_cloud(f"sample-pcds/{camera_name}_fixed.pcd", pcd)
+    #     o3d.io.write_point_cloud(f"sample-pcds/{camera_name}_fixed.pcd", pcd)
 
     #     # o3d.visualization.draw_geometries([pcd])
     #     pcds.append(pcd)
         
     # o3d.visualization.draw_geometries(pcds)
-    # # pcd = integrate_pointclouds_tsdf(rgb_frames, depth_frames, camera_params_list)
+    # pcd = integrate_pointclouds_tsdf(rgb_frames, depth_frames, camera_params_list)
     # # o3d.visualization.draw_geometries([pcd])
 
-    hp_reader = get_handpose_reader("./2023_08_11_14_15_21/meta_data/holo_data_wpose.csv")
+    hp_reader = get_handpose_reader("./full_depth/meta_data/holo_data_wpose.csv")
     holo_params = CAMERA_PARAMS["hololens"]     
     camera_params = CAMERA_PARAMS["Aoutput0"]
     points, world2holo = hp_reader(600)
     u, v = reproject_handpose(points, world2holo, holo_params, camera_params)
     print(u.shape, v.shape)
     # show on image
-    image = cv2.imread(f"full_depth/Aoutput0_600_rgb.png")
+    image = cv2.imread("full_depth/Aoutput0_600_rgb.png")
     for i in range(u.shape[0]):
+        print(int(u[i]), int(v[i]))
         cv2.circle(image, (int(u[i]), int(v[i])), 5, (0, 0, 255), -1)
     cv2.imshow("Image", image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+    # frame = cv2.imread("full_depth/hololens_600.jpg")
+    # frame = reproject_handpose_to_holo(points, world2holo, holo_params, frame)
+    # cv2.imshow("Frame", frame)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
